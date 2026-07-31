@@ -1,3 +1,580 @@
+library(shiny)
+library(sf)
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(leaflet)
+library(leaflet.extras)
+library(htmltools)
+library(plotly)
+
+# ==============================================================================
+# CARGA DE DATOS BASE
+# ==============================================================================
+
+capa_laplata <- st_read("LA PLATA.kml", quiet = TRUE) %>% 
+  mutate(
+    Name = as.character(Name),
+    barrio_normalizado = str_trim(toupper(Name))
+  ) %>% 
+  st_transform(crs = 4326)
+
+reclamos_raw <- read_excel("Reclamos.xlsx")
+
+# Aseguramos la columna DELEGACION
+if ("DELEGACION" %in% names(reclamos_raw)) {
+  reclamos_raw <- reclamos_raw %>% mutate(DELEGACION = str_trim(as.character(DELEGACION)))
+} else {
+  reclamos_raw$DELEGACION <- "SIN ESPECIFICAR"
+}
+
+# Aseguramos la columna AREA ASIGNADA
+if ("AREA ASIGNADA" %in% names(reclamos_raw)) {
+  reclamos_raw <- reclamos_raw %>% mutate(`AREA ASIGNADA` = str_trim(as.character(`AREA ASIGNADA`)))
+} else {
+  reclamos_raw$`AREA ASIGNADA` <- "SIN ESPECIFICAR"
+}
+
+# Aseguramos la columna SUBTIPO | CARATULA
+if (!("SUBTIPO | CARATULA" %in% names(reclamos_raw))) {
+  reclamos_raw$`SUBTIPO | CARATULA` <- "SIN ESPECIFICAR"
+}
+
+# ==============================================================================
+# LÓGICA DEL SERVIDOR (SERVER FUNCTION)
+# ==============================================================================
+
+server <- function(input, output, session) {
+  
+  # ----------------------------------------------------------------------------
+  # FILTROS DINÁMICOS
+  # ----------------------------------------------------------------------------
+  observe({
+    delegaciones <- c("Todos", sort(unique(na.omit(reclamos_raw$DELEGACION))))
+    areas <- c("Todos", sort(unique(na.omit(reclamos_raw$`AREA ASIGNADA`))))
+    
+    updateSelectInput(session, "filtro_delegacion", choices = delegaciones, selected = "Todos")
+    updateSelectInput(session, "filtro_area", choices = areas, selected = "Todos")
+  })
+  
+  # Actualización en cascada para Subtipos según Delegación y Área seleccionadas
+  observe({
+    datos_temp <- reclamos_raw
+    if (!is.null(input$filtro_delegacion) && input$filtro_delegacion != "Todos") {
+      datos_temp <- datos_temp %>% filter(DELEGACION == input$filtro_delegacion)
+    }
+    if (!is.null(input$filtro_area) && input$filtro_area != "Todos") {
+      datos_temp <- datos_temp %>% filter(`AREA ASIGNADA` == input$filtro_area)
+    }
+    
+    subtipos <- c("Todos", sort(unique(na.omit(datos_temp$`SUBTIPO | CARATULA`))))
+    updateSelectInput(session, "filtro_subtipo", choices = subtipos, selected = "Todos")
+  })
+  
+  # Filtrado reactivo general
+  reclamos_filtrados <- reactive({
+    datos <- reclamos_raw
+    if (!is.null(input$filtro_delegacion) && input$filtro_delegacion != "Todos") {
+      datos <- datos %>% filter(DELEGACION == input$filtro_delegacion)
+    }
+    if (!is.null(input$filtro_area) && input$filtro_area != "Todos") {
+      datos <- datos %>% filter(`AREA ASIGNADA` == input$filtro_area)
+    }
+    if (!is.null(input$filtro_subtipo) && input$filtro_subtipo != "Todos") {
+      datos <- datos %>% filter(`SUBTIPO | CARATULA` == input$filtro_subtipo)
+    }
+    datos
+  })
+  
+  puntos_reclamos_sf <- reactive({
+    reclamos_filtrados() %>% 
+      filter(!is.na(COORDENADAS)) %>% 
+      separate(COORDENADAS, into = c("lat", "lng"), sep = ",", remove = FALSE, convert = TRUE) %>% 
+      filter(!is.na(lat), !is.na(lng)) %>% 
+      st_as_sf(coords = c("lng", "lat"), crs = 4326, remove = FALSE)
+  })
+  
+  # ----------------------------------------------------------------------------
+  # GRÁFICO BARRAS: ÁREA OPERATIVA
+  # ----------------------------------------------------------------------------
+  output$grafico_area_operativa <- renderPlotly({
+    datos_grafico <- reclamos_filtrados() %>% 
+      count(`AREA ASIGNADA`, name = "total") %>% 
+      filter(!is.na(`AREA ASIGNADA`)) %>% 
+      arrange(total)
+    
+    if(nrow(datos_grafico) == 0) return(NULL)
+    
+    plot_ly(
+      data = datos_grafico,
+      x = ~total,
+      y = ~reorder(`AREA ASIGNADA`, total),
+      type = 'bar',
+      orientation = 'h',
+      marker = list(
+        color = '#0284c7',
+        line = list(color = '#38bdf8', width = 1)
+      ),
+      hoverinfo = "text",
+      text = ~paste0("<b>", `AREA ASIGNADA`, "</b><br>Reclamos: ", format(total, big.mark = "."))
+    ) %>% 
+      layout(
+        paper_bgcolor = 'rgba(0,0,0,0)',
+        plot_bgcolor = 'rgba(0,0,0,0)',
+        margin = list(l = 10, r = 10, t = 10, b = 20),
+        xaxis = list(
+          title = "",
+          tickfont = list(color = '#94a3b8', size = 10),
+          gridcolor = '#1e293b',
+          zerolinecolor = '#334155'
+        ),
+        yaxis = list(
+          title = "",
+          tickfont = list(color = '#f1f5f9', size = 10),
+          autorange = "reversed"
+        )
+      ) %>% 
+      config(displayModeBar = FALSE)
+  })
+  
+  # ----------------------------------------------------------------------------
+  # MAPA Y PROCESAMIENTO GEOGRÁFICO
+  # ----------------------------------------------------------------------------
+  datos_procesados <- reactive({
+    datos <- reclamos_filtrados() %>% 
+      select(delegacion = `DELEGACION`, subtipo_caratula = `SUBTIPO | CARATULA`) %>% 
+      filter(!is.na(delegacion), !is.na(subtipo_caratula)) %>% 
+      mutate(delegacion = str_trim(toupper(as.character(delegacion))))
+    
+    if (nrow(datos) == 0) {
+      empty_map <- capa_laplata %>% mutate(total_reclamos = 0, html_final = "<div>Sin datos</div>")
+      return(list(mapa_data = empty_map, html_tabla_flotante = "<div style='color:white; padding:10px;'>Sin datos.</div>"))
+    }
+    
+    ranking_general_subtipo <- datos %>% 
+      count(subtipo_caratula) %>% 
+      arrange(desc(n)) %>% 
+      mutate(ranking_num = row_number(), pct_general = (n / sum(n)) * 100, subtipo_con_ranking = paste0(ranking_num, ". ", subtipo_caratula))
+    
+    desviaciones_subtipo <- datos %>% 
+      count(delegacion, subtipo_caratula) %>% 
+      group_by(delegacion) %>% 
+      mutate(total_delegacion = sum(n), pct_local = (n / total_delegacion) * 100) %>% 
+      ungroup() %>% 
+      left_join(ranking_general_subtipo %>% select(subtipo_caratula, pct_general, subtipo_con_ranking), by = "subtipo_caratula") %>% 
+      mutate(desviacion = pct_local - pct_general) %>% 
+      arrange(delegacion, desc(abs(desviacion)))
+    
+    popups_subtipo_html <- desviaciones_subtipo %>% 
+      mutate(
+        estado = if_else(desviacion > 0, "▲ Encima", "▼ Debajo"),
+        color_estado = if_else(desviacion > 0, "#60a5fa", "#f87171"),
+        fila_html = sprintf("<tr><td style='padding:4px; font-size:11px; border-bottom:1px solid #334155; color:#cbd5e1;'>%s</td><td style='padding:4px; text-align:right; font-size:11px; color:%s; font-weight:bold; border-bottom:1px solid #334155;'>%s (%+.1f%%)</td></tr>", subtipo_con_ranking, color_estado, estado, desviacion)
+      ) %>% 
+      group_by(delegacion) %>% 
+      summarise(total_reclamos = first(total_delegacion), tabla_completa = paste(head(fila_html, 15), collapse = "")) %>% 
+      mutate(html_final = sprintf("<div style='min-width:300px; max-height:260px; overflow-y:auto; font-family:Arial; color:#f8fafc; background-color:#1e293b; padding:10px; border-radius:6px;'><h4 style='margin:0; color:#007a87; font-size:14px;'>Delegación: %s</h4><p style='margin:0 0 6px 0; font-size:11px; color:#94a3b8;'>Total: <strong>%s</strong></p><table style='width:100%%;'>%s</table></div>", delegacion, format(total_reclamos, big.mark = "."), tabla_completa))
+    
+    filas_tabla_general <- ranking_general_subtipo %>% 
+      mutate(fila = sprintf("<tr><td style='padding:4px; font-size:11px; color:#cbd5e1;'>%s</td><td style='padding:4px; text-align:right; font-size:11px; color:#fff;'>%s</td><td style='padding:4px; text-align:right; font-size:11px; color:#007a87;'>%.1f%%</td></tr>", subtipo_con_ranking, format(n, big.mark = "."), pct_general)) %>% 
+      pull(fila) %>% paste(collapse = "")
+    
+    html_tabla_flotante <- sprintf("<div style='background: rgba(30, 41, 59, 0.92); padding: 10px; border-radius: 8px; border: 1px solid #475569; max-height: 240px; width: 300px; overflow-y: auto; color: #f8fafc;'><h5 style='margin:0 0 6px 0; color:#007a87;'>Promedio General Ciudad</h5><table style='width:100%%;'>%s</table></div>", filas_tabla_general)
+    
+    mapa_unido <- capa_laplata %>% 
+      left_join(popups_subtipo_html, by = c("barrio_normalizado" = "delegacion")) %>% 
+      mutate(total_reclamos = ifelse(is.na(total_reclamos), 0, total_reclamos), html_final = ifelse(is.na(html_final), sprintf("<div style='color:#fff;'><strong>%s</strong><br>Sin datos.</div>", Name), html_final))
+    
+    list(mapa_data = mapa_unido, html_tabla_flotante = html_tabla_flotante)
+  })
+  
+  output$mapa_interactivo <- renderLeaflet({
+    leaflet() %>%
+      addProviderTiles(providers$CartoDB.DarkMatter, group = "Oscuro (Default)") %>% 
+      addProviderTiles(providers$CartoDB.Positron, group = "Claro / Simple") %>% 
+      addProviderTiles(providers$Esri.WorldImagery, group = "Satélite") %>% 
+      addProviderTiles(providers$OpenStreetMap.Mapnik, group = "Calles (OSM)") %>% 
+      setView(lng = -57.9545, lat = -34.9214, zoom = 12)
+  })
+  
+  observe({
+    res <- datos_procesados()
+    mapa_data <- res$mapa_data
+    html_tabla_flotante <- res$html_tabla_flotante
+    puntos <- puntos_reclamos_sf()
+    paleta <- colorNumeric(palette = "YlOrRd", domain = mapa_data$total_reclamos)
+    
+    proxy <- leafletProxy("mapa_interactivo") %>%
+      clearGroup("barrio_destacado") %>% 
+      clearShapes() %>% clearMarkers() %>% clearMarkerClusters() %>% clearControls()
+    
+    proxy %>% 
+      addPolygons(
+        data = mapa_data, layerId = ~Name, group = "Delegaciones / Barrios",
+        fillColor = ~paleta(total_reclamos), 
+        fillOpacity = 0.2, # Reducido a 0.2 para dar ese efecto traslúcido de fondo
+        color = "#475569", 
+        weight = 1.2, 
+        dashArray = "3",
+        highlightOptions = highlightOptions(weight = 3, color = "#38bdf8", fillOpacity = 0.5, bringToFront = TRUE),
+        label = ~paste0("Delegación: ", Name, " | Reclamos: ", format(total_reclamos, big.mark = ".")),
+        popup = ~html_final
+      ) %>% 
+      addLegend(pal = paleta, values = mapa_data$total_reclamos, opacity = 0.8, title = "Cant. Reclamos", position = "bottomright") %>% 
+      addControl(html = html_tabla_flotante, position = "topright", className = "info legend")
+    
+    if (nrow(puntos) > 0) {
+      proxy %>% 
+        addCircleMarkers(data = puntos, group = "Puntos de Reclamo", radius = 4, color = "#38bdf8", stroke = FALSE, fillOpacity = 0.7, clusterOptions = markerClusterOptions(), popup = ~paste0("<strong>Subtipo: </strong>", `SUBTIPO | CARATULA`, "<br><strong>Delegación: </strong>", DELEGACION)) %>% 
+        addHeatmap(data = puntos, group = "Mapa de Calor", lng = ~lng, lat = ~lat, blur = 12, max = 0.35, radius = 8, minOpacity = 0.3)
+    }
+    
+    proxy %>% 
+      addLayersControl(
+        baseGroups = c("Oscuro (Default)", "Claro / Simple", "Satélite", "Calles (OSM)"),
+        overlayGroups = c("Delegaciones / Barrios", "Puntos de Reclamo", "Mapa de Calor"),
+        options = layersControlOptions(collapsed = TRUE), position = "bottomleft"
+      ) %>% 
+      hideGroup(c("Puntos de Reclamo", "Mapa de Calor"))
+  })
+  
+  # ----------------------------------------------------------------------------
+  # RESALTAR DELEGACIÓN EN AZUL SEGÚN EL FILTRO DE SELECCIÓN
+  # ----------------------------------------------------------------------------
+  observeEvent(input$filtro_delegacion, {
+    proxy <- leafletProxy("mapa_interactivo", session)
+    proxy %>% clearGroup("barrio_destacado")
+    
+    if (!is.null(input$filtro_delegacion) && input$filtro_delegacion != "Todos") {
+      barrio_sel <- capa_laplata %>% 
+        filter(barrio_normalizado == str_trim(toupper(input$filtro_delegacion)))
+      
+      if (nrow(barrio_sel) > 0) {
+        proxy %>% addPolygons(
+          data = barrio_sel, 
+          group = "barrio_destacado", 
+          fillColor = "#0284c7",   # Azul principal idéntico al de las barras
+          fillOpacity = 0.75,     # Opaco y destacado
+          color = "#38bdf8",       # Borde celeste brillante de acento
+          weight = 3, 
+          opacity = 1, 
+          options = pathOptions(pane = "markerPane")
+        )
+      }
+    }
+  }, ignoreInit = TRUE)
+  
+  # INTERACCIONES Y SELECCIÓN
+  capas_visibles <- reactiveValues(poligonos = TRUE, puntos = FALSE, calor = FALSE)
+  
+  observeEvent(input$btn_capa_poligonos, {
+    capas_visibles$poligonos <- !capas_visibles$poligonos
+    if (capas_visibles$poligonos) leafletProxy("mapa_interactivo") %>% showGroup("Delegaciones / Barrios")
+    else leafletProxy("mapa_interactivo") %>% hideGroup("Delegaciones / Barrios")
+  })
+  
+  observeEvent(input$btn_capa_puntos, {
+    capas_visibles$puntos <- !capas_visibles$puntos
+    if (capas_visibles$puntos) leafletProxy("mapa_interactivo") %>% showGroup("Puntos de Reclamo")
+    else leafletProxy("mapa_interactivo") %>% hideGroup("Puntos de Reclamo")
+  })
+  
+  observeEvent(input$btn_capa_calor, {
+    capas_visibles$calor <- !capas_visibles$calor
+    if (capas_visibles$calor) leafletProxy("mapa_interactivo") %>% showGroup("Mapa de Calor")
+    else leafletProxy("mapa_interactivo") %>% hideGroup("Mapa de Calor")
+  })
+  
+  observeEvent(input$btn_centrar_mapa, {
+    leafletProxy("mapa_interactivo") %>% setView(lng = -57.9545, lat = -34.9214, zoom = 12)
+  })
+  
+  observeEvent(input$mapa_interactivo_shape_click, {
+    click <- input$mapa_interactivo_shape_click
+    if (is.null(click$id)) return()
+    mapa_data <- datos_procesados()$mapa_data
+    barrio_seleccionado <- mapa_data %>% filter(Name == click$id)
+    leafletProxy("mapa_interactivo", session) %>%
+      clearGroup("barrio_destacado") %>%
+      addPolygons(data = barrio_seleccionado, group = "barrio_destacado", fillColor = "#0284c7", fillOpacity = 0.75, color = "#38bdf8", weight = 3, opacity = 1, options = pathOptions(pane = "markerPane"))
+  })
+  
+  observeEvent(input$mapa_interactivo_click, {
+    leafletProxy("mapa_interactivo", session) %>% clearGroup("barrio_destacado") %>% clearPopups()
+  })
+  
+  observeEvent(list(input$filtro_area, input$filtro_subtipo), {
+    if (input$filtro_delegacion == "Todos") {
+      leafletProxy("mapa_interactivo", session) %>% clearGroup("barrio_destacado")
+    }
+  }, ignoreInit = TRUE)
+}
+
+
+
+
+
+
+
+library(shiny)
+library(bslib)
+library(leaflet)
+library(plotly)
+
+ui <- page_navbar(
+  theme = bs_theme(
+    version = 5,
+    bg = "#0f171e",         # Fondo oscuro institucional
+    fg = "#ffffff",         # Texto blanco
+    primary = "#007380",    # Verde/Azul Institucional (Petrol)
+    secondary = "#38bdf8",  # Azul claro acento
+    base_font = font_google("Inter")
+  ),
+  
+  header = tags$head(
+    tags$link(rel = "stylesheet", href = "https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css"),
+    tags$style(HTML("
+      /* Sidebar de Gráfico (Derecha) */
+      .sidebar-derecha {
+        position: fixed;
+        top: 55px;
+        right: 0;
+        width: 360px;
+        height: calc(100vh - 55px);
+        background-color: #16202b;
+        z-index: 1050;
+        padding: 20px 15px;
+        box-shadow: -4px 0 15px rgba(0,0,0,0.5);
+        transition: transform 0.3s ease-in-out;
+        color: white;
+        overflow-y: auto;
+        border-left: 1px solid #2d3748;
+      }
+      .sidebar-derecha.colapsada {
+        transform: translateX(360px);
+      }
+      .btn-toggle-right {
+        position: fixed;
+        top: 70px;
+        right: 370px;
+        z-index: 1051;
+        background-color: #1e293b;
+        color: #007380;
+        border: 1px solid #475569;
+        border-radius: 6px;
+        width: 38px;
+        height: 38px;
+        cursor: pointer;
+        transition: right 0.3s ease-in-out, background-color 0.2s;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+      }
+      .btn-toggle-right.colapsado {
+        right: 15px;
+      }
+      .btn-toggle-right:hover {
+        background-color: #334155;
+        color: #38bdf8;
+      }
+    ")),
+    tags$script(HTML("
+      $(document).on('click', '#toggle_right', function() {
+        $('.sidebar-derecha').toggleClass('colapsada');
+        $('#toggle_right').toggleClass('colapsado');
+        $('#icon_right').toggleClass('fa-chevron-right fa-chart-bar');
+      });
+
+      $(document).on('click', '#btn_ir_mapa', function() {
+        $('a[data-value=\"Mapa Interactivo\"]').tab('show');
+      });
+    "))
+  ),
+  
+  title = div(
+    style = "display: flex; align-items: center; gap: 12px;",
+    img(src = "logo_laplata.png", height = "35px", style = "object-fit: contain;"),
+    span(style = "font-weight: 700; font-size: 16px; color: #ffffff;", "INFORME DE BARRIOS INTERACTIVO")
+  ),
+  id = "nav_main",
+  fillable = TRUE,
+  
+  # PESTAÑA 1: PRESENTACIÓN
+  nav_panel(
+    title = "Presentación",
+    icon = icon("house"),
+    
+    div(
+      style = "padding: 30px; max-width: 1200px; margin: 0 auto;",
+      
+      div(
+        style = "background: linear-gradient(135deg, #007380 0%, #004d56 100%); 
+                 padding: 40px; border-radius: 12px; margin-bottom: 30px; 
+                 box-shadow: 0 10px 25px rgba(0,0,0,0.4); text-align: center;",
+        
+        img(src = "logo_laplata.png", height = "80px", style = "margin-bottom: 20px; max-width: 100%; object-fit: contain;"),
+        
+        h1(style = "color: #ffffff; font-weight: 800; font-size: 28px; margin-bottom: 15px; letter-spacing: -0.5px;", 
+           "Sistema de Monitorización Urbana y Reclamos"),
+        
+        p(style = "font-size: 16px; color: #e2e8f0; max-width: 800px; margin: 0 auto 25px auto; line-height: 1.6;",
+          "Bienvenido a la plataforma geográfica interactiva de la Ciudad de La Plata. ",
+          "Este portal permite analizar la distribución territorial de los reclamos urbanos, identificar patrones anómalos por delegación y evaluar la carga operativa asignada a cada área."
+        ),
+        
+        actionButton("btn_ir_mapa", " Explorar Mapa Interactivo", 
+                     style = "background-color: #ffffff; color: #007380; font-weight: 700; border: none; padding: 12px 28px; font-size: 16px; border-radius: 8px; cursor: pointer;", 
+                     icon = icon("map-location-dot"))
+      ),
+      
+      layout_column_wrap(
+        width = 1/3,
+        style = "margin-bottom: 30px;",
+        
+        value_box(
+          title = "Cobertura Territorial",
+          value = "La Plata",
+          showcase = icon("city", style = "color: #38bdf8;"),
+          style = "background-color: #16202b; border: 1px solid #007380;",
+          p("Análisis a nivel delegación y barrios")
+        ),
+        value_box(
+          title = "Gestión Operativa",
+          value = "Filtros en Vivo",
+          showcase = icon("filter", style = "color: #38bdf8;"),
+          style = "background-color: #16202b; border: 1px solid #007380;",
+          p("Segmentación por Delegación, Área y Subtipo")
+        ),
+        value_box(
+          title = "Detección de Anomalías",
+          value = "Top 15",
+          showcase = icon("chart-line", style = "color: #38bdf8;"),
+          style = "background-color: #16202b; border: 1px solid #007380;",
+          p("Desviaciones locales vs. Promedio General")
+        )
+      ),
+      
+      card(
+        style = "background-color: #16202b; border: 1px solid #2d3748;",
+        card_header(
+          style = "background-color: #007380; color: #ffffff; font-weight: 700;", 
+          " Guía Rápida de Exploración"
+        ),
+        card_body(
+          layout_column_wrap(
+            width = 1/2,
+            div(
+              h5(style = "color: #38bdf8; font-weight: 600;", "1. Mapa Geográfico"),
+              p(style = "color: #9ca3af; font-size: 14px;", "Selecciona delegaciones en el mapa para desplegar su ficha de desviaciones respecto al promedio de la ciudad.")
+            ),
+            div(
+              h5(style = "color: #38bdf8; font-weight: 600;", "2. Panel de Filtros y Gráficos"),
+              p(style = "color: #9ca3af; font-size: 14px;", "Usa la barra lateral izquierda para refinar datos y el botón flotante derecho para desplegar la distribución por área operativa.")
+            )
+          )
+        )
+      )
+    )
+  ),
+  
+  # PESTAÑA 2: MAPA INTERACTIVO
+  nav_panel(
+    title = "Mapa Interactivo",
+    icon = icon("map"),
+    
+    div(
+      style = "position: relative; width: 100%; height: calc(100vh - 55px); overflow: hidden;",
+      
+      tags$button(
+        id = "toggle_right", 
+        class = "btn-toggle-right", 
+        title = "Desplegar / Ocultar gráfico por área",
+        tags$i(id = "icon_right", class = "fa-solid fa-chevron-right")
+      ),
+      
+      div(
+        class = "sidebar-derecha",
+        h3(style = "margin-top:0; color:#38bdf8; font-size:16px; font-weight:bold; border-bottom:1px solid #334155; padding-bottom:8px;", "Análisis por Área"),
+        p(style = "font-size:11px; color:#94a3b8; margin-bottom:15px;", "Distribución de reclamos registrados según el Área Operativa Asignada."),
+        plotlyOutput("grafico_area_operativa", height = "75vh")
+      ),
+      
+      page_sidebar(
+        fillable = TRUE,
+        padding = 0,
+        
+        sidebar = sidebar(
+          title = "Filtros y Control",
+          width = 300,
+          bg = "#16202b",
+          
+          # REEMPLAZO: Filtro por Delegación
+          selectInput(
+            inputId = "filtro_delegacion", 
+            label = "Delegación / Barrio", 
+            choices = c("Todos"), 
+            selected = "Todos"
+          ),
+          
+          selectInput(
+            inputId = "filtro_area", 
+            label = "Área Asignada", 
+            choices = c("Todos"), 
+            selected = "Todos"
+          ),
+          
+          selectInput(
+            inputId = "filtro_subtipo", 
+            label = "Subtipo / Carátula", 
+            choices = c("Todos"), 
+            selected = "Todos"
+          ),
+          
+          hr(style = "border-top: 1px solid #2d3748; margin: 15px 0;"),
+          
+          p(style = "font-size: 12px; color: #9ca3af;",
+            "Usa la tabla flotante superior derecha en el mapa para ver el ranking general de la ciudad."),
+          p(style = "font-size: 12px; color: #9ca3af;",
+            "Al hacer clic sobre cualquier delegación, se desplegará el reporte detallado con sus 15 principales desviaciones locales.")
+        ),
+        
+        card(
+          full_screen = TRUE,
+          card_header(style = "color: #007a87; font-weight: bold;", "Distribución Espacial y Análisis de Anomalías de Reclamos"),
+          leafletOutput("mapa_interactivo", height = "100%")
+        )
+      )
+    )
+  )
+)
+FROM rocker/shiny:latest
+
+# Instalar dependencias del sistema necesarias para paquetes geoespaciales
+RUN apt-get update && apt-get install -y \
+    libcurl4-gnutls-dev \
+    libssl-dev \
+    libxml2-dev \
+    libudunits2-dev \
+    libgdal-dev \
+    libgeos-dev \
+    libproj-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Instalar todos los paquetes de R que utiliza tu aplicación
+RUN R -e "install.packages(c('shiny', 'sf', 'readxl', 'dplyr', 'tidyr', 'stringr', 'leaflet', 'leaflet.extras', 'htmltools', 'plotly', 'bslib', 'ggplot2'), repos='https://cloud.r-project.org/')"
+
+# Configurar el directorio de trabajo
+WORKDIR /app
+
+# Copiar todos los archivos del repositorio al contenedor
+COPY . .
+
+# Exponer el puerto
+EXPOSE 10000
+
+# Comando de ejecución
+CMD ["R", "-e", "shiny::runApp('.', host = '0.0.0.0', port = as.numeric(Sys.getenv('PORT', 10000)))"]
 <?xml version="1.0" encoding="UTF-8"?>
 <kml xmlns="http://www.opengis.net/kml/2.2">
   <Document>
@@ -3856,577 +4433,3 @@
     </Placemark>
   </Document>
 </kml>
-
-library(shiny)
-library(sf)
-library(readxl)
-library(dplyr)
-library(tidyr)
-library(stringr)
-library(leaflet)
-library(leaflet.extras)
-library(htmltools)
-library(plotly)
-
-# ==============================================================================
-# CARGA DE DATOS BASE
-# ==============================================================================
-
-capa_laplata <- st_read("LA PLATA.kml", quiet = TRUE) %>% 
-  mutate(
-    Name = as.character(Name),
-    barrio_normalizado = str_trim(toupper(Name))
-  ) %>% 
-  st_transform(crs = 4326)
-
-reclamos_raw <- read_excel("Reclamos.xlsx")
-
-# Aseguramos la columna DELEGACION
-if ("DELEGACION" %in% names(reclamos_raw)) {
-  reclamos_raw <- reclamos_raw %>% mutate(DELEGACION = str_trim(as.character(DELEGACION)))
-} else {
-  reclamos_raw$DELEGACION <- "SIN ESPECIFICAR"
-}
-
-# Aseguramos la columna AREA ASIGNADA
-if ("AREA ASIGNADA" %in% names(reclamos_raw)) {
-  reclamos_raw <- reclamos_raw %>% mutate(`AREA ASIGNADA` = str_trim(as.character(`AREA ASIGNADA`)))
-} else {
-  reclamos_raw$`AREA ASIGNADA` <- "SIN ESPECIFICAR"
-}
-
-# Aseguramos la columna SUBTIPO | CARATULA
-if (!("SUBTIPO | CARATULA" %in% names(reclamos_raw))) {
-  reclamos_raw$`SUBTIPO | CARATULA` <- "SIN ESPECIFICAR"
-}
-
-# ==============================================================================
-# LÓGICA DEL SERVIDOR (SERVER FUNCTION)
-# ==============================================================================
-
-server <- function(input, output, session) {
-  
-  # ----------------------------------------------------------------------------
-  # FILTROS DINÁMICOS
-  # ----------------------------------------------------------------------------
-  observe({
-    delegaciones <- c("Todos", sort(unique(na.omit(reclamos_raw$DELEGACION))))
-    areas <- c("Todos", sort(unique(na.omit(reclamos_raw$`AREA ASIGNADA`))))
-    
-    updateSelectInput(session, "filtro_delegacion", choices = delegaciones, selected = "Todos")
-    updateSelectInput(session, "filtro_area", choices = areas, selected = "Todos")
-  })
-  
-  # Actualización en cascada para Subtipos según Delegación y Área seleccionadas
-  observe({
-    datos_temp <- reclamos_raw
-    if (!is.null(input$filtro_delegacion) && input$filtro_delegacion != "Todos") {
-      datos_temp <- datos_temp %>% filter(DELEGACION == input$filtro_delegacion)
-    }
-    if (!is.null(input$filtro_area) && input$filtro_area != "Todos") {
-      datos_temp <- datos_temp %>% filter(`AREA ASIGNADA` == input$filtro_area)
-    }
-    
-    subtipos <- c("Todos", sort(unique(na.omit(datos_temp$`SUBTIPO | CARATULA`))))
-    updateSelectInput(session, "filtro_subtipo", choices = subtipos, selected = "Todos")
-  })
-  
-  # Filtrado reactivo general
-  reclamos_filtrados <- reactive({
-    datos <- reclamos_raw
-    if (!is.null(input$filtro_delegacion) && input$filtro_delegacion != "Todos") {
-      datos <- datos %>% filter(DELEGACION == input$filtro_delegacion)
-    }
-    if (!is.null(input$filtro_area) && input$filtro_area != "Todos") {
-      datos <- datos %>% filter(`AREA ASIGNADA` == input$filtro_area)
-    }
-    if (!is.null(input$filtro_subtipo) && input$filtro_subtipo != "Todos") {
-      datos <- datos %>% filter(`SUBTIPO | CARATULA` == input$filtro_subtipo)
-    }
-    datos
-  })
-  
-  puntos_reclamos_sf <- reactive({
-    reclamos_filtrados() %>% 
-      filter(!is.na(COORDENADAS)) %>% 
-      separate(COORDENADAS, into = c("lat", "lng"), sep = ",", remove = FALSE, convert = TRUE) %>% 
-      filter(!is.na(lat), !is.na(lng)) %>% 
-      st_as_sf(coords = c("lng", "lat"), crs = 4326, remove = FALSE)
-  })
-  
-  # ----------------------------------------------------------------------------
-  # GRÁFICO BARRAS: ÁREA OPERATIVA
-  # ----------------------------------------------------------------------------
-  output$grafico_area_operativa <- renderPlotly({
-    datos_grafico <- reclamos_filtrados() %>% 
-      count(`AREA ASIGNADA`, name = "total") %>% 
-      filter(!is.na(`AREA ASIGNADA`)) %>% 
-      arrange(total)
-    
-    if(nrow(datos_grafico) == 0) return(NULL)
-    
-    plot_ly(
-      data = datos_grafico,
-      x = ~total,
-      y = ~reorder(`AREA ASIGNADA`, total),
-      type = 'bar',
-      orientation = 'h',
-      marker = list(
-        color = '#0284c7',
-        line = list(color = '#38bdf8', width = 1)
-      ),
-      hoverinfo = "text",
-      text = ~paste0("<b>", `AREA ASIGNADA`, "</b><br>Reclamos: ", format(total, big.mark = "."))
-    ) %>% 
-      layout(
-        paper_bgcolor = 'rgba(0,0,0,0)',
-        plot_bgcolor = 'rgba(0,0,0,0)',
-        margin = list(l = 10, r = 10, t = 10, b = 20),
-        xaxis = list(
-          title = "",
-          tickfont = list(color = '#94a3b8', size = 10),
-          gridcolor = '#1e293b',
-          zerolinecolor = '#334155'
-        ),
-        yaxis = list(
-          title = "",
-          tickfont = list(color = '#f1f5f9', size = 10),
-          autorange = "reversed"
-        )
-      ) %>% 
-      config(displayModeBar = FALSE)
-  })
-  
-  # ----------------------------------------------------------------------------
-  # MAPA Y PROCESAMIENTO GEOGRÁFICO
-  # ----------------------------------------------------------------------------
-  datos_procesados <- reactive({
-    datos <- reclamos_filtrados() %>% 
-      select(delegacion = `DELEGACION`, subtipo_caratula = `SUBTIPO | CARATULA`) %>% 
-      filter(!is.na(delegacion), !is.na(subtipo_caratula)) %>% 
-      mutate(delegacion = str_trim(toupper(as.character(delegacion))))
-    
-    if (nrow(datos) == 0) {
-      empty_map <- capa_laplata %>% mutate(total_reclamos = 0, html_final = "<div>Sin datos</div>")
-      return(list(mapa_data = empty_map, html_tabla_flotante = "<div style='color:white; padding:10px;'>Sin datos.</div>"))
-    }
-    
-    ranking_general_subtipo <- datos %>% 
-      count(subtipo_caratula) %>% 
-      arrange(desc(n)) %>% 
-      mutate(ranking_num = row_number(), pct_general = (n / sum(n)) * 100, subtipo_con_ranking = paste0(ranking_num, ". ", subtipo_caratula))
-    
-    desviaciones_subtipo <- datos %>% 
-      count(delegacion, subtipo_caratula) %>% 
-      group_by(delegacion) %>% 
-      mutate(total_delegacion = sum(n), pct_local = (n / total_delegacion) * 100) %>% 
-      ungroup() %>% 
-      left_join(ranking_general_subtipo %>% select(subtipo_caratula, pct_general, subtipo_con_ranking), by = "subtipo_caratula") %>% 
-      mutate(desviacion = pct_local - pct_general) %>% 
-      arrange(delegacion, desc(abs(desviacion)))
-    
-    popups_subtipo_html <- desviaciones_subtipo %>% 
-      mutate(
-        estado = if_else(desviacion > 0, "▲ Encima", "▼ Debajo"),
-        color_estado = if_else(desviacion > 0, "#60a5fa", "#f87171"),
-        fila_html = sprintf("<tr><td style='padding:4px; font-size:11px; border-bottom:1px solid #334155; color:#cbd5e1;'>%s</td><td style='padding:4px; text-align:right; font-size:11px; color:%s; font-weight:bold; border-bottom:1px solid #334155;'>%s (%+.1f%%)</td></tr>", subtipo_con_ranking, color_estado, estado, desviacion)
-      ) %>% 
-      group_by(delegacion) %>% 
-      summarise(total_reclamos = first(total_delegacion), tabla_completa = paste(head(fila_html, 15), collapse = "")) %>% 
-      mutate(html_final = sprintf("<div style='min-width:300px; max-height:260px; overflow-y:auto; font-family:Arial; color:#f8fafc; background-color:#1e293b; padding:10px; border-radius:6px;'><h4 style='margin:0; color:#007a87; font-size:14px;'>Delegación: %s</h4><p style='margin:0 0 6px 0; font-size:11px; color:#94a3b8;'>Total: <strong>%s</strong></p><table style='width:100%%;'>%s</table></div>", delegacion, format(total_reclamos, big.mark = "."), tabla_completa))
-    
-    filas_tabla_general <- ranking_general_subtipo %>% 
-      mutate(fila = sprintf("<tr><td style='padding:4px; font-size:11px; color:#cbd5e1;'>%s</td><td style='padding:4px; text-align:right; font-size:11px; color:#fff;'>%s</td><td style='padding:4px; text-align:right; font-size:11px; color:#007a87;'>%.1f%%</td></tr>", subtipo_con_ranking, format(n, big.mark = "."), pct_general)) %>% 
-      pull(fila) %>% paste(collapse = "")
-    
-    html_tabla_flotante <- sprintf("<div style='background: rgba(30, 41, 59, 0.92); padding: 10px; border-radius: 8px; border: 1px solid #475569; max-height: 240px; width: 300px; overflow-y: auto; color: #f8fafc;'><h5 style='margin:0 0 6px 0; color:#007a87;'>Promedio General Ciudad</h5><table style='width:100%%;'>%s</table></div>", filas_tabla_general)
-    
-    mapa_unido <- capa_laplata %>% 
-      left_join(popups_subtipo_html, by = c("barrio_normalizado" = "delegacion")) %>% 
-      mutate(total_reclamos = ifelse(is.na(total_reclamos), 0, total_reclamos), html_final = ifelse(is.na(html_final), sprintf("<div style='color:#fff;'><strong>%s</strong><br>Sin datos.</div>", Name), html_final))
-    
-    list(mapa_data = mapa_unido, html_tabla_flotante = html_tabla_flotante)
-  })
-  
-  output$mapa_interactivo <- renderLeaflet({
-    leaflet() %>%
-      addProviderTiles(providers$CartoDB.DarkMatter, group = "Oscuro (Default)") %>% 
-      addProviderTiles(providers$CartoDB.Positron, group = "Claro / Simple") %>% 
-      addProviderTiles(providers$Esri.WorldImagery, group = "Satélite") %>% 
-      addProviderTiles(providers$OpenStreetMap.Mapnik, group = "Calles (OSM)") %>% 
-      setView(lng = -57.9545, lat = -34.9214, zoom = 12)
-  })
-  
-  observe({
-    res <- datos_procesados()
-    mapa_data <- res$mapa_data
-    html_tabla_flotante <- res$html_tabla_flotante
-    puntos <- puntos_reclamos_sf()
-    paleta <- colorNumeric(palette = "YlOrRd", domain = mapa_data$total_reclamos)
-    
-    proxy <- leafletProxy("mapa_interactivo") %>%
-      clearGroup("barrio_destacado") %>% 
-      clearShapes() %>% clearMarkers() %>% clearMarkerClusters() %>% clearControls()
-    
-    proxy %>% 
-      addPolygons(
-        data = mapa_data, layerId = ~Name, group = "Delegaciones / Barrios",
-        fillColor = ~paleta(total_reclamos), 
-        fillOpacity = 0.2, # Reducido a 0.2 para dar ese efecto traslúcido de fondo
-        color = "#475569", 
-        weight = 1.2, 
-        dashArray = "3",
-        highlightOptions = highlightOptions(weight = 3, color = "#38bdf8", fillOpacity = 0.5, bringToFront = TRUE),
-        label = ~paste0("Delegación: ", Name, " | Reclamos: ", format(total_reclamos, big.mark = ".")),
-        popup = ~html_final
-      ) %>% 
-      addLegend(pal = paleta, values = mapa_data$total_reclamos, opacity = 0.8, title = "Cant. Reclamos", position = "bottomright") %>% 
-      addControl(html = html_tabla_flotante, position = "topright", className = "info legend")
-    
-    if (nrow(puntos) > 0) {
-      proxy %>% 
-        addCircleMarkers(data = puntos, group = "Puntos de Reclamo", radius = 4, color = "#38bdf8", stroke = FALSE, fillOpacity = 0.7, clusterOptions = markerClusterOptions(), popup = ~paste0("<strong>Subtipo: </strong>", `SUBTIPO | CARATULA`, "<br><strong>Delegación: </strong>", DELEGACION)) %>% 
-        addHeatmap(data = puntos, group = "Mapa de Calor", lng = ~lng, lat = ~lat, blur = 12, max = 0.35, radius = 8, minOpacity = 0.3)
-    }
-    
-    proxy %>% 
-      addLayersControl(
-        baseGroups = c("Oscuro (Default)", "Claro / Simple", "Satélite", "Calles (OSM)"),
-        overlayGroups = c("Delegaciones / Barrios", "Puntos de Reclamo", "Mapa de Calor"),
-        options = layersControlOptions(collapsed = TRUE), position = "bottomleft"
-      ) %>% 
-      hideGroup(c("Puntos de Reclamo", "Mapa de Calor"))
-  })
-  
-  # ----------------------------------------------------------------------------
-  # RESALTAR DELEGACIÓN EN AZUL SEGÚN EL FILTRO DE SELECCIÓN
-  # ----------------------------------------------------------------------------
-  observeEvent(input$filtro_delegacion, {
-    proxy <- leafletProxy("mapa_interactivo", session)
-    proxy %>% clearGroup("barrio_destacado")
-    
-    if (!is.null(input$filtro_delegacion) && input$filtro_delegacion != "Todos") {
-      barrio_sel <- capa_laplata %>% 
-        filter(barrio_normalizado == str_trim(toupper(input$filtro_delegacion)))
-      
-      if (nrow(barrio_sel) > 0) {
-        proxy %>% addPolygons(
-          data = barrio_sel, 
-          group = "barrio_destacado", 
-          fillColor = "#0284c7",   # Azul principal idéntico al de las barras
-          fillOpacity = 0.75,     # Opaco y destacado
-          color = "#38bdf8",       # Borde celeste brillante de acento
-          weight = 3, 
-          opacity = 1, 
-          options = pathOptions(pane = "markerPane")
-        )
-      }
-    }
-  }, ignoreInit = TRUE)
-  
-  # INTERACCIONES Y SELECCIÓN
-  capas_visibles <- reactiveValues(poligonos = TRUE, puntos = FALSE, calor = FALSE)
-  
-  observeEvent(input$btn_capa_poligonos, {
-    capas_visibles$poligonos <- !capas_visibles$poligonos
-    if (capas_visibles$poligonos) leafletProxy("mapa_interactivo") %>% showGroup("Delegaciones / Barrios")
-    else leafletProxy("mapa_interactivo") %>% hideGroup("Delegaciones / Barrios")
-  })
-  
-  observeEvent(input$btn_capa_puntos, {
-    capas_visibles$puntos <- !capas_visibles$puntos
-    if (capas_visibles$puntos) leafletProxy("mapa_interactivo") %>% showGroup("Puntos de Reclamo")
-    else leafletProxy("mapa_interactivo") %>% hideGroup("Puntos de Reclamo")
-  })
-  
-  observeEvent(input$btn_capa_calor, {
-    capas_visibles$calor <- !capas_visibles$calor
-    if (capas_visibles$calor) leafletProxy("mapa_interactivo") %>% showGroup("Mapa de Calor")
-    else leafletProxy("mapa_interactivo") %>% hideGroup("Mapa de Calor")
-  })
-  
-  observeEvent(input$btn_centrar_mapa, {
-    leafletProxy("mapa_interactivo") %>% setView(lng = -57.9545, lat = -34.9214, zoom = 12)
-  })
-  
-  observeEvent(input$mapa_interactivo_shape_click, {
-    click <- input$mapa_interactivo_shape_click
-    if (is.null(click$id)) return()
-    mapa_data <- datos_procesados()$mapa_data
-    barrio_seleccionado <- mapa_data %>% filter(Name == click$id)
-    leafletProxy("mapa_interactivo", session) %>%
-      clearGroup("barrio_destacado") %>%
-      addPolygons(data = barrio_seleccionado, group = "barrio_destacado", fillColor = "#0284c7", fillOpacity = 0.75, color = "#38bdf8", weight = 3, opacity = 1, options = pathOptions(pane = "markerPane"))
-  })
-  
-  observeEvent(input$mapa_interactivo_click, {
-    leafletProxy("mapa_interactivo", session) %>% clearGroup("barrio_destacado") %>% clearPopups()
-  })
-  
-  observeEvent(list(input$filtro_area, input$filtro_subtipo), {
-    if (input$filtro_delegacion == "Todos") {
-      leafletProxy("mapa_interactivo", session) %>% clearGroup("barrio_destacado")
-    }
-  }, ignoreInit = TRUE)
-}
-
-
-
-
-
-
-
-library(shiny)
-library(bslib)
-library(leaflet)
-library(plotly)
-
-ui <- page_navbar(
-  theme = bs_theme(
-    version = 5,
-    bg = "#0f171e",         # Fondo oscuro institucional
-    fg = "#ffffff",         # Texto blanco
-    primary = "#007380",    # Verde/Azul Institucional (Petrol)
-    secondary = "#38bdf8",  # Azul claro acento
-    base_font = font_google("Inter")
-  ),
-  
-  header = tags$head(
-    tags$link(rel = "stylesheet", href = "https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css"),
-    tags$style(HTML("
-      /* Sidebar de Gráfico (Derecha) */
-      .sidebar-derecha {
-        position: fixed;
-        top: 55px;
-        right: 0;
-        width: 360px;
-        height: calc(100vh - 55px);
-        background-color: #16202b;
-        z-index: 1050;
-        padding: 20px 15px;
-        box-shadow: -4px 0 15px rgba(0,0,0,0.5);
-        transition: transform 0.3s ease-in-out;
-        color: white;
-        overflow-y: auto;
-        border-left: 1px solid #2d3748;
-      }
-      .sidebar-derecha.colapsada {
-        transform: translateX(360px);
-      }
-      .btn-toggle-right {
-        position: fixed;
-        top: 70px;
-        right: 370px;
-        z-index: 1051;
-        background-color: #1e293b;
-        color: #007380;
-        border: 1px solid #475569;
-        border-radius: 6px;
-        width: 38px;
-        height: 38px;
-        cursor: pointer;
-        transition: right 0.3s ease-in-out, background-color 0.2s;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-      }
-      .btn-toggle-right.colapsado {
-        right: 15px;
-      }
-      .btn-toggle-right:hover {
-        background-color: #334155;
-        color: #38bdf8;
-      }
-    ")),
-    tags$script(HTML("
-      $(document).on('click', '#toggle_right', function() {
-        $('.sidebar-derecha').toggleClass('colapsada');
-        $('#toggle_right').toggleClass('colapsado');
-        $('#icon_right').toggleClass('fa-chevron-right fa-chart-bar');
-      });
-
-      $(document).on('click', '#btn_ir_mapa', function() {
-        $('a[data-value=\"Mapa Interactivo\"]').tab('show');
-      });
-    "))
-  ),
-  
-  title = div(
-    style = "display: flex; align-items: center; gap: 12px;",
-    img(src = "logo_laplata.png", height = "35px", style = "object-fit: contain;"),
-    span(style = "font-weight: 700; font-size: 16px; color: #ffffff;", "INFORME DE BARRIOS INTERACTIVO")
-  ),
-  id = "nav_main",
-  fillable = TRUE,
-  
-  # PESTAÑA 1: PRESENTACIÓN
-  nav_panel(
-    title = "Presentación",
-    icon = icon("house"),
-    
-    div(
-      style = "padding: 30px; max-width: 1200px; margin: 0 auto;",
-      
-      div(
-        style = "background: linear-gradient(135deg, #007380 0%, #004d56 100%); 
-                 padding: 40px; border-radius: 12px; margin-bottom: 30px; 
-                 box-shadow: 0 10px 25px rgba(0,0,0,0.4); text-align: center;",
-        
-        img(src = "logo_laplata.png", height = "80px", style = "margin-bottom: 20px; max-width: 100%; object-fit: contain;"),
-        
-        h1(style = "color: #ffffff; font-weight: 800; font-size: 28px; margin-bottom: 15px; letter-spacing: -0.5px;", 
-           "Sistema de Monitorización Urbana y Reclamos"),
-        
-        p(style = "font-size: 16px; color: #e2e8f0; max-width: 800px; margin: 0 auto 25px auto; line-height: 1.6;",
-          "Bienvenido a la plataforma geográfica interactiva de la Ciudad de La Plata. ",
-          "Este portal permite analizar la distribución territorial de los reclamos urbanos, identificar patrones anómalos por delegación y evaluar la carga operativa asignada a cada área."
-        ),
-        
-        actionButton("btn_ir_mapa", " Explorar Mapa Interactivo", 
-                     style = "background-color: #ffffff; color: #007380; font-weight: 700; border: none; padding: 12px 28px; font-size: 16px; border-radius: 8px; cursor: pointer;", 
-                     icon = icon("map-location-dot"))
-      ),
-      
-      layout_column_wrap(
-        width = 1/3,
-        style = "margin-bottom: 30px;",
-        
-        value_box(
-          title = "Cobertura Territorial",
-          value = "La Plata",
-          showcase = icon("city", style = "color: #38bdf8;"),
-          style = "background-color: #16202b; border: 1px solid #007380;",
-          p("Análisis a nivel delegación y barrios")
-        ),
-        value_box(
-          title = "Gestión Operativa",
-          value = "Filtros en Vivo",
-          showcase = icon("filter", style = "color: #38bdf8;"),
-          style = "background-color: #16202b; border: 1px solid #007380;",
-          p("Segmentación por Delegación, Área y Subtipo")
-        ),
-        value_box(
-          title = "Detección de Anomalías",
-          value = "Top 15",
-          showcase = icon("chart-line", style = "color: #38bdf8;"),
-          style = "background-color: #16202b; border: 1px solid #007380;",
-          p("Desviaciones locales vs. Promedio General")
-        )
-      ),
-      
-      card(
-        style = "background-color: #16202b; border: 1px solid #2d3748;",
-        card_header(
-          style = "background-color: #007380; color: #ffffff; font-weight: 700;", 
-          " Guía Rápida de Exploración"
-        ),
-        card_body(
-          layout_column_wrap(
-            width = 1/2,
-            div(
-              h5(style = "color: #38bdf8; font-weight: 600;", "1. Mapa Geográfico"),
-              p(style = "color: #9ca3af; font-size: 14px;", "Selecciona delegaciones en el mapa para desplegar su ficha de desviaciones respecto al promedio de la ciudad.")
-            ),
-            div(
-              h5(style = "color: #38bdf8; font-weight: 600;", "2. Panel de Filtros y Gráficos"),
-              p(style = "color: #9ca3af; font-size: 14px;", "Usa la barra lateral izquierda para refinar datos y el botón flotante derecho para desplegar la distribución por área operativa.")
-            )
-          )
-        )
-      )
-    )
-  ),
-  
-  # PESTAÑA 2: MAPA INTERACTIVO
-  nav_panel(
-    title = "Mapa Interactivo",
-    icon = icon("map"),
-    
-    div(
-      style = "position: relative; width: 100%; height: calc(100vh - 55px); overflow: hidden;",
-      
-      tags$button(
-        id = "toggle_right", 
-        class = "btn-toggle-right", 
-        title = "Desplegar / Ocultar gráfico por área",
-        tags$i(id = "icon_right", class = "fa-solid fa-chevron-right")
-      ),
-      
-      div(
-        class = "sidebar-derecha",
-        h3(style = "margin-top:0; color:#38bdf8; font-size:16px; font-weight:bold; border-bottom:1px solid #334155; padding-bottom:8px;", "Análisis por Área"),
-        p(style = "font-size:11px; color:#94a3b8; margin-bottom:15px;", "Distribución de reclamos registrados según el Área Operativa Asignada."),
-        plotlyOutput("grafico_area_operativa", height = "75vh")
-      ),
-      
-      page_sidebar(
-        fillable = TRUE,
-        padding = 0,
-        
-        sidebar = sidebar(
-          title = "Filtros y Control",
-          width = 300,
-          bg = "#16202b",
-          
-          # REEMPLAZO: Filtro por Delegación
-          selectInput(
-            inputId = "filtro_delegacion", 
-            label = "Delegación / Barrio", 
-            choices = c("Todos"), 
-            selected = "Todos"
-          ),
-          
-          selectInput(
-            inputId = "filtro_area", 
-            label = "Área Asignada", 
-            choices = c("Todos"), 
-            selected = "Todos"
-          ),
-          
-          selectInput(
-            inputId = "filtro_subtipo", 
-            label = "Subtipo / Carátula", 
-            choices = c("Todos"), 
-            selected = "Todos"
-          ),
-          
-          hr(style = "border-top: 1px solid #2d3748; margin: 15px 0;"),
-          
-          p(style = "font-size: 12px; color: #9ca3af;",
-            "Usa la tabla flotante superior derecha en el mapa para ver el ranking general de la ciudad."),
-          p(style = "font-size: 12px; color: #9ca3af;",
-            "Al hacer clic sobre cualquier delegación, se desplegará el reporte detallado con sus 15 principales desviaciones locales.")
-        ),
-        
-        card(
-          full_screen = TRUE,
-          card_header(style = "color: #007a87; font-weight: bold;", "Distribución Espacial y Análisis de Anomalías de Reclamos"),
-          leafletOutput("mapa_interactivo", height = "100%")
-        )
-      )
-    )
-  )
-)
-FROM rocker/shiny:latest
-
-# Instalamos las librerías del sistema
-RUN apt-get update && apt-get install -y \
-    libcurl4-gnutls-dev \
-    libssl-dev \
-    libxml2-dev \
-    libudunits2-dev \
-    libgdal-dev \
-    libgeos-dev \
-    libproj-dev \
-    && rm -rf /var/lib/apt/lists/*
-
-# Instalamos los paquetes de R
-RUN R -e "install.packages(c('shiny', 'dplyr', 'ggplot2', 'leaflet', 'readxl', 'bslib', 'sf', 'tidyr'), repos='https://cloud.r-project.org/')"
-
-WORKDIR /app
-COPY . .
-
-EXPOSE 10000
-
-# El comando "." le dice a Shiny que busque app.R O la pareja ui.R/server.R en la carpeta actual
-CMD ["R", "-e", "shiny::runApp('.', host = '0.0.0.0', port = as.numeric(Sys.getenv('PORT', 10000)))"]
